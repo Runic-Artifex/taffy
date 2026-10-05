@@ -535,7 +535,10 @@ fn compute_inner(
         || style.contain().establishes_independent_formatting_context();
 
     // Determine margin collapsing behaviour
-    let own_margins_collapse_with_children = Line {
+    //
+    // Whether a child's margins could collapse through each of this box's block-axis edges: the
+    // box does not establish a new BFC and has neither border nor padding on that side.
+    let children_margins_adjoin_own_edges = Line {
         start: vertical_margins_are_collapsible.start
             && !establishes_new_bfc
             && !style.position().is_out_of_flow()
@@ -545,8 +548,11 @@ fn compute_inner(
             && !establishes_new_bfc
             && !style.position().is_out_of_flow()
             && padding.bottom == 0.0
-            && border.bottom == 0.0
-            && size.height.is_none(),
+            && border.bottom == 0.0,
+    };
+    let own_margins_collapse_with_children = Line {
+        start: children_margins_adjoin_own_edges.start,
+        end: children_margins_adjoin_own_edges.end && size.height.is_none(),
     };
     let has_styles_preventing_being_collapsed_through = !style.is_block()
         || block_ctx.is_bfc_root()
@@ -621,6 +627,7 @@ fn compute_inner(
         text_align,
         direction,
         own_margins_collapse_with_children,
+        children_margins_adjoin_own_edges,
         #[cfg(feature = "content_size")]
         is_scroll_container,
         block_ctx,
@@ -921,20 +928,31 @@ fn generate_item_list(
 /// intrinsic sizing keywords (`min-content`, `max-content`, `fit-content`, `fit-content(...)`)
 /// are all equal to the content size, which is what an auto height already resolves to, so
 /// only `stretch` requires explicit resolution.
+///
+/// Each of the item's block-axis margins is subtracted from the stretch size unless it is
+/// flagged in `margins_treated_as_zero`: when stretching a block-level box, a margin that
+/// could collapse through the corresponding edge of the containing block (which has neither
+/// border nor padding on that side and does not establish a new BFC) is treated as zero.
+/// <https://github.com/w3c/csswg-drafts/issues/11044#issuecomment-2599101601>
+/// <https://github.com/w3c/csswg-drafts/issues/13260>
 #[inline]
 fn resolve_stretch_height(
     height_style: Dimension,
     container_inner_height: Option<f32>,
-    item_y_margin_sum: f32,
+    item_margin: Rect<f32>,
+    margins_treated_as_zero: Line<bool>,
 ) -> Option<f32> {
-    match resolve_sizing_keyword(
-        height_style,
-        container_inner_height.maybe_sub(item_y_margin_sum),
-        container_inner_height,
-    ) {
-        Some(SizingKeywordResolution::Exact(height)) => Some(height),
-        _ => None,
+    if !height_style.is_stretch() {
+        return None;
     }
+    let mut height = container_inner_height?;
+    if !margins_treated_as_zero.start {
+        height -= item_margin.top;
+    }
+    if !margins_treated_as_zero.end {
+        height -= item_margin.bottom;
+    }
+    Some(height)
 }
 
 /// Compute the content-based width in the case that the width of the container is not known
@@ -1008,6 +1026,7 @@ fn perform_final_layout_on_in_flow_children(
     text_align: TextAlign,
     direction: Direction,
     own_margins_collapse_with_children: Line<bool>,
+    children_margins_adjoin_own_edges: Line<bool>,
     #[cfg(feature = "content_size")] is_scroll_container: bool,
     block_ctx: &mut BlockContext<'_>,
 ) -> (Rect<f32>, f32, CollapsibleMarginSet, CollapsibleMarginSet, Option<f32>) {
@@ -1098,7 +1117,9 @@ fn perform_final_layout_on_in_flow_children(
                 let item_known_height = resolve_stretch_height(
                     item.size_style.height,
                     container_percentage_resolution_height,
-                    item_non_auto_margin.vertical_axis_sum(),
+                    item_non_auto_margin,
+                    // The margins of a float never collapse
+                    Line::FALSE,
                 );
                 let mut item_layout = tree.perform_child_layout(
                     item.node_id,
@@ -1295,7 +1316,8 @@ fn perform_final_layout_on_in_flow_children(
                 let keyword_height = resolve_stretch_height(
                     item.size_style.height,
                     container_percentage_resolution_height,
-                    item_non_auto_margin.vertical_axis_sum(),
+                    item_non_auto_margin,
+                    children_margins_adjoin_own_edges,
                 );
 
                 item.size
