@@ -223,6 +223,10 @@ struct AlgoConstants {
     container_size: Size<f32>,
     /// The size of the internal container
     inner_container_size: Size<f32>,
+
+    /// Whether the tree wants the layouts of this container's children to be computed in batches
+    /// (see [`LayoutPartialTree::batches_child_layouts`])
+    batch_child_layouts: bool,
 }
 
 impl AlgoConstants {
@@ -351,6 +355,7 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
         parent_size,
         available_space,
     );
+    constants.batch_child_layouts = tree.batches_child_layouts(node);
 
     // 9. Flex Layout Algorithm
 
@@ -689,6 +694,7 @@ fn compute_constants(
         cross_axis_available_space_is_definite,
         container_size,
         inner_container_size,
+        batch_child_layouts: false,
     }
 }
 
@@ -1109,7 +1115,7 @@ fn determine_flex_base_size(
                 .with_cross(dir, cross_axis_available_space);
 
             let input = LayoutInput { available_space: child_available_space, ..child.measure_input };
-            request_item_measurement(tree, jobs, child, input);
+            request_item_measurement(tree, constants, jobs, child, input);
             None
         };
         child.has_job = flex_basis.is_none();
@@ -1121,7 +1127,7 @@ fn determine_flex_base_size(
     compute_requested_measurements(tree, node, jobs);
     let mut measured = jobs.iter();
     for child in flex_items.iter_mut().filter(|child| child.has_job) {
-        child.flex_basis = measured_size(tree, &mut measured, child).main(dir);
+        child.flex_basis = measured_size(tree, constants, &mut measured, child).main(dir);
     }
 
     // Collect a measurement job for each item whose minimum main size depends on its content
@@ -1158,7 +1164,7 @@ fn determine_flex_base_size(
             let cross_axis_available_space = child.measure_input.available_space.cross(dir);
             let child_available_space = Size::MIN_CONTENT.with_cross(dir, cross_axis_available_space);
             let input = LayoutInput { available_space: child_available_space, ..child.measure_input };
-            request_item_measurement(tree, jobs, child, input);
+            request_item_measurement(tree, constants, jobs, child, input);
         }
     }
 
@@ -1173,7 +1179,7 @@ fn determine_flex_base_size(
         let padding_border_axes_sums = (child.padding + child.border).sum_axes().map(Some);
 
         if child.has_job {
-            let min_content_main_size = measured_size(tree, &mut measured, child).main(dir);
+            let min_content_main_size = measured_size(tree, constants, &mut measured, child).main(dir);
 
             // 4.5. Automatic Minimum Size of Flex Items
             // https://www.w3.org/TR/css-flexbox-1/#min-size-auto
@@ -1630,7 +1636,7 @@ fn determine_container_main_size(
                                     vertical_margins_are_collapsible: Line::FALSE,
                                 };
                                 let input = item.measure_input;
-                                request_item_measurement(tree, jobs, item, input);
+                                request_item_measurement(tree, constants, jobs, item, input);
                                 None
                             }
                         };
@@ -1650,7 +1656,7 @@ fn determine_container_main_size(
                             let style_min = item.min_size.main(constants.dir);
                             let style_max = item.max_size.main(constants.dir);
                             let child_known_dimensions = item.measure_input.known_dimensions;
-                            let measured_main_size = measured_size(tree, &mut measured, item).main(dir);
+                            let measured_main_size = measured_size(tree, constants, &mut measured, item).main(dir);
 
                             // A known cross size is transferred through the item's aspect-ratio
                             // and floors the measured content size
@@ -2033,7 +2039,7 @@ fn determine_hypothetical_cross_size(
                 },
                 vertical_margins_are_collapsible: Line::FALSE,
             };
-            request_item_measurement(tree, jobs, child, input);
+            request_item_measurement(tree, constants, jobs, child, input);
         }
     }
 
@@ -2048,7 +2054,7 @@ fn determine_hypothetical_cross_size(
                 child.min_size.maybe_apply_aspect_ratio(child.aspect_ratio).cross(constants.dir);
             let transferred_max_cross =
                 child.max_size.maybe_apply_aspect_ratio(child.aspect_ratio).cross(constants.dir);
-            measured_size(tree, &mut measured, child)
+            measured_size(tree, constants, &mut measured, child)
                 .get_abs(constants.dir.cross_axis())
                 .maybe_clamp(transferred_min_cross, transferred_max_cross)
                 .max(padding_border_sum)
@@ -2127,7 +2133,7 @@ fn calculate_children_base_lines<Tree: LayoutFlexboxContainer>(
                 },
                 vertical_margins_are_collapsible: Line::FALSE,
             };
-            if Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL {
+            if Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL && constants.batch_child_layouts {
                 jobs.push(ChildLayoutJob::new(child.node, input));
             } else {
                 let output = tree.compute_child_layout(child.node, input);
@@ -2638,12 +2644,13 @@ fn final_layout_input(constants: &AlgoConstants, item: &FlexItem) -> LayoutInput
 #[inline(always)]
 fn request_item_measurement<Tree: LayoutPartialTree>(
     tree: &mut Tree,
+    constants: &AlgoConstants,
     jobs: &mut Vec<ChildLayoutJob>,
     item: &mut FlexItem,
     input: LayoutInput,
 ) {
     item.has_job = true;
-    if Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL {
+    if Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL && constants.batch_child_layouts {
         jobs.push(ChildLayoutJob::new(item.node, input));
     } else {
         item.measured_size = tree.compute_child_layout(item.node, input).size;
@@ -2653,6 +2660,7 @@ fn request_item_measurement<Tree: LayoutPartialTree>(
 /// Compute the measurements requested by [`request_item_measurement`] that have not been computed yet
 #[inline(always)]
 fn compute_requested_measurements<Tree: LayoutPartialTree>(tree: &mut Tree, node: NodeId, jobs: &mut [ChildLayoutJob]) {
+    // No jobs are collected for a container whose child layouts are not computed in batches
     if Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL && !jobs.is_empty() {
         tree.compute_child_layouts(node, jobs);
     }
@@ -2663,10 +2671,11 @@ fn compute_requested_measurements<Tree: LayoutPartialTree>(tree: &mut Tree, node
 #[inline(always)]
 fn measured_size<'a, Tree: LayoutPartialTree>(
     _tree: &Tree,
+    constants: &AlgoConstants,
     measured: &mut impl Iterator<Item = &'a ChildLayoutJob>,
     item: &FlexItem,
 ) -> Size<f32> {
-    if Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL {
+    if Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL && constants.batch_child_layouts {
         measured.next().unwrap().output.size
     } else {
         item.measured_size
@@ -2875,7 +2884,8 @@ fn final_layout_pass<Tree: LayoutFlexboxContainer>(
     // of child layouts in parallel then the items are laid out as a batch and then positioned from the results.
     // Otherwise each item is laid out when it is positioned.
     jobs.clear();
-    if Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL {
+    let batch_child_layouts = Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL && constants.batch_child_layouts;
+    if batch_child_layouts {
         for item in flex_lines.iter().flat_map(|line| line.items.iter()) {
             jobs.push(ChildLayoutJob::new(item.node, final_layout_input(constants, item)));
         }
@@ -2896,7 +2906,7 @@ fn final_layout_pass<Tree: LayoutFlexboxContainer>(
     if constants.is_wrap_reverse {
         let mut job_end = jobs.len();
         for line in flex_lines.iter_mut().rev() {
-            let line_jobs = Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL.then(|| {
+            let line_jobs = batch_child_layouts.then(|| {
                 let job_start = job_end - line.items.len();
                 let line_jobs = &mut jobs[job_start..job_end];
                 job_end = job_start;
@@ -2917,7 +2927,7 @@ fn final_layout_pass<Tree: LayoutFlexboxContainer>(
     } else {
         let mut job_start = 0;
         for line in flex_lines.iter_mut() {
-            let line_jobs = Tree::COMPUTES_CHILD_LAYOUTS_IN_PARALLEL.then(|| {
+            let line_jobs = batch_child_layouts.then(|| {
                 let job_end = job_start + line.items.len();
                 let line_jobs = &mut jobs[job_start..job_end];
                 job_start = job_end;
