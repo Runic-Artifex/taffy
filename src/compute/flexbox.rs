@@ -999,6 +999,11 @@ fn determine_flex_base_size(
                     Some(SizingKeywordResolution::Measure(available)) => Some(available),
                     None => None,
                 }
+            } else if flex_basis.is_none() && !flex_basis_style.is_auto() {
+                // A percentage flex basis that cannot be resolved (the container's main size is
+                // indefinite) is `content` (css-flexbox-1 §7.2.3), not the main size property, as
+                // in Chromium: a `flex: 1 1 0%` item of an auto-height column is sized by its content
+                None
             } else {
                 if let Some(flex_basis) = flex_basis.or(main_size) {
                     child.flex_basis_is_definite = true;
