@@ -1368,6 +1368,28 @@ fn determine_container_main_size(
     let main_content_box_inset = constants.content_box_inset.main_axis_sum(constants.dir);
 
     let outer_main_size: f32 = constants.node_outer_size.main(constants.dir).unwrap_or_else(|| {
+        // A column container's automatic main size is the largest sum over its lines of its items'
+        // outer hypothetical main sizes (their flex base sizes clamped by their used min and max main
+        // sizes, automatic minimum sizes included), whatever the available space: Chromium's
+        // `FlexLayoutAlgorithm::PlaceFlexItems` takes `max_sum_hypothetical_main_size` as a column's
+        // intrinsic block size rather than css-flexbox-1 §9.9.1's max-content flex fractions. A
+        // growing scroll container (no automatic minimum size) thus contributes its flex base size
+        // floored by its `min-height`, and an item whose flex base size is below its content and
+        // has `min-height: 0` contributes its flex base size (it overflows the container).
+        if !constants.is_row {
+            let main_axis_gap = constants.gap.main(dir);
+            let longest_line_length = lines
+                .iter()
+                .map(|line| {
+                    line.items.iter().map(|item| item.hypothetical_outer_size.main(dir)).sum::<f32>()
+                        + sum_axis_gaps(main_axis_gap, line.items.len())
+                })
+                .max_by(|a, b| a.total_cmp(b))
+                .unwrap_or(0.0);
+            return longest_line_length + main_content_box_inset;
+        }
+
+        // Row containers only from here
         match available_space.main(dir) {
             AvailableSpace::Definite(main_axis_available_space) => {
                 let main_axis_gap = constants.gap.main(constants.dir);
@@ -1464,19 +1486,12 @@ fn determine_container_main_size(
 
                         // The spec seems a bit unclear on this point (my initial reading was that the `.maybe_max(style_preferred)` should
                         // not be included here), however for row containers this matches both Chrome and Firefox as of 9th March 2023.
-                        // For column containers the flex base size alone is the clamping basis (as the spec says): a column item's
-                        // `height` must not inflate the container's max-content size beyond the item's flex-basis.
                         //
                         // Spec: https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions
                         // Spec modification: https://www.w3.org/TR/css-flexbox-1/#change-2016-max-contribution
                         // Issue: https://github.com/w3c/csswg-drafts/issues/1435
                         // Gentest: padding_border_overrides_size_flex_basis_0.html
-                        // Gentest: blockflex_min_content_ignores_own_height_as_percentage_basis.html
-                        let clamping_basis = if constants.is_row {
-                            Some(item.flex_basis).maybe_max(style_preferred)
-                        } else {
-                            Some(item.flex_basis)
-                        };
+                        let clamping_basis = Some(item.flex_basis).maybe_max(style_preferred);
                         let flex_basis_min = clamping_basis.filter(|_| item.flex_shrink == 0.0);
                         let flex_basis_max = clamping_basis.filter(|_| item.flex_grow == 0.0);
 
@@ -1510,13 +1525,8 @@ fn determine_container_main_size(
                                 let item_pb_main = item.padding.main_axis_sum(constants.dir)
                                     + item.border.main_axis_sum(constants.dir);
                                 let inner_main_size = pref.max(item_pb_main);
-                                if constants.is_row {
-                                    (inner_main_size + item.margin.main_axis_sum(constants.dir))
-                                        .maybe_clamp(style_min, style_max)
-                                } else {
-                                    (inner_main_size.max(item.flex_basis) + item.margin.main_axis_sum(constants.dir))
-                                        .maybe_clamp(style_min, style_max)
-                                }
+                                (inner_main_size + item.margin.main_axis_sum(constants.dir))
+                                    .maybe_clamp(style_min, style_max)
                             }
 
                             _ => {
@@ -1583,29 +1593,15 @@ fn determine_container_main_size(
                                 let transferred_main_size = item
                                     .aspect_ratio
                                     .zip(child_known_dimensions.cross(dir))
-                                    .map(|(ratio, cross)| if constants.is_row { cross * ratio } else { cross / ratio });
+                                    .map(|(ratio, cross)| cross * ratio);
 
                                 let inner_main_size = measured_main_size.maybe_max(transferred_main_size);
 
-                                // This is somewhat bizarre in that it's asymmetrical depending whether the flex container is a column or a row.
-                                //
-                                // I *think* this might relate to https://drafts.csswg.org/css-flexbox-1/#algo-main-container:
-                                //
-                                //    "The automatic block size of a block-level flex container is its max-content size."
-                                //
-                                // Which could suggest that flex-basis defining a vertical size does not shrink because it is in the block axis, and the automatic size
-                                // in the block axis is a MAX content size. Whereas a flex-basis defining a horizontal size does shrink because the automatic size in
-                                // inline axis is MIN content size (although I don't have a reference for that).
-                                //
-                                // Ultimately, this was not found by reading the spec, but by trial and error fixing tests to align with Webkit/Firefox output.
-                                // (see the `flex_basis_unconstraint_row` and `flex_basis_uncontraint_column` generated tests which demonstrate this)
-                                if constants.is_row {
-                                    (inner_main_size + item.margin.main_axis_sum(constants.dir))
-                                        .maybe_clamp(style_min, style_max)
-                                } else {
-                                    (inner_main_size.max(item.flex_basis) + item.margin.main_axis_sum(constants.dir))
-                                        .maybe_clamp(style_min, style_max)
-                                }
+                                // A row item's flex basis does not floor its contribution (a column's does, through its
+                                // hypothetical main size, above). See the `flex_basis_unconstraint_row` and
+                                // `flex_basis_uncontraint_column` generated tests.
+                                (inner_main_size + item.margin.main_axis_sum(constants.dir))
+                                    .maybe_clamp(style_min, style_max)
                             }
                         };
                         item.content_flex_fraction = {
